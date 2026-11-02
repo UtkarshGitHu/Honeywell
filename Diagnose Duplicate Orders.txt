@@ -1,0 +1,38 @@
+
+The React client experiences a network timeout waiting for the API response, despite the server successfully processing the order.
+The client blindly retries the identical payload, resulting in a duplicate database insert because the API treats it as a new request.  
+
+
+
+The .NET API is performing non-atomic operations by writing to the database and publishing to the message broker sequentially. 
+If the SQL transaction deadlocks or fails after the OrderCreated message is dispatched, the message goes out but the database rolls back, creating a ghost order.
+   
+
+Retries generate a lot of concurrent, identical requests competing for the same database resources. 
+Without proper indexing or optimal transaction isolation these requests block each other and deadlock.
+   
+
+
+Proposed Practical FixReact Client:
+Generate a stable Idempotency-Key (e.g., UUID) when the user clicks submit.
+Send this key in the HTTP headers for the initial POST and all subsequent retry attempts.
+
+The API must open a single SQL transaction to do two things simultaneously: 
+insert the order into the Orders table and insert the serialized event into an Outbox table.
+
+Add a UNIQUE constraint on the IdempotencyKey column in the Orders table to enforce deduplication at the schema level and handle concurrent retry race conditions. 
+
+
+Remove the direct publish call from the API request thread. Instead, deploy a background worker (e.g., a .NET Hosted Service) that continuously reads unpublished records from the Outbox table, publishes them to the message broker, and marks them as processed upon broker acknowledgment.
+
+
+Observability: We can Track idempotency_cache_hits to monitor how often the client safely retries and is caught by the idempotency check.
+
+Monitor SQL Server Deadlocks/sec
+
+Deploy the new Outbox table, the IdempotencyKey column, and the unique constraint to the database.
+
+Deploy the updated .NET API with the Outbox writing logic and background worker.
+Wrap the legacy direct-publish logic in a feature flag so it can be instantly disabled once the Outbox worker is verified in production.
+
+Deploy the updated React client so it begins appending the Idempotency-Key header to all order payloads.

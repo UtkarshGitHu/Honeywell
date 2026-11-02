@@ -1,0 +1,103 @@
+using System;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.EntityFrameworkCore;
+
+public enum ReservationOutcome { Success, InsufficientStock, InvalidInput, Error }
+public record ReservationResult(ReservationOutcome Outcome, string Message = null);
+
+public interface IInventoryService
+{
+    Task<ReservationResult> ReserveAsync(string sku, int quantity, string idempotencyKey, CancellationToken ct);
+}
+
+public class InventoryService : IInventoryService
+{
+    private readonly InventoryDbContext _db;
+
+    public InventoryService(InventoryDbContext db)
+    {
+        _db = db;
+    }
+
+    public async Task<ReservationResult> ReserveAsync(string sku, int quantity, string idempotencyKey, CancellationToken ct)
+    {
+        // Please validate input
+        if (string.IsNullOrWhiteSpace(sku) || quantity <= 0 || string.IsNullOrWhiteSpace(idempotencyKey))
+        {
+            return new ReservationResult(ReservationOutcome.InvalidInput, "Invalid reservation parameters.");
+        }
+
+        // Use Serializable isolation to prevent read-write race conditions on the idempotency check
+        using var tx = await _db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable, ct);
+        try
+        {
+            // Idempotency Check
+            bool alreadyProcessed = await _db.Reservations
+                .AnyAsync(re => re.IdempotencyKey == idempotencyKey, ct);
+            
+            if (alreadyProcessed)
+            {
+                return new ReservationResult(ReservationOutcome.Success, "Reservation has already been processed.");
+            }
+
+            // Executes as a direct SQL UPDATE with a WHERE clause condition. 
+            // Prevents overselling inherently at the database engine level.
+            int rowsAffected = await _db.InventoryItems
+                .Where(i => i.Sku == sku && i.AvailableQuantity >= quantity)
+                .ExecuteUpdateAsync(s => s.SetProperty(i => i.AvailableQuantity, i => i.AvailableQuantity - quantity), ct);
+
+            if (rowsAffected == 0)
+            {
+                bool exists = await _db.InventoryItems.AnyAsync(i => i.Sku == sku, ct);
+                return exists 
+                    ? new ReservationResult(ReservationOutcome.InsufficientStock, "Not enough stocks are available.")
+                    : new ReservationResult(ReservationOutcome.InvalidInput, "SKU does not exist over here.");
+            }
+
+            // Persist Reservation and Idempotency Key
+            _db.Reservations.Add(new ReservationRecord 
+            { 
+                IdempotencyKey = idempotencyKey, 
+                Sku = sku, 
+                Quantity = quantity,
+                CreatedAt = DateTime.UtcNow
+            });
+
+            await _db.SaveChangesAsync(ct);
+            await tx.CommitAsync(ct);
+
+            return new ReservationResult(ReservationOutcome.Success);
+        }
+        catch (Exception ex)
+        {
+            await tx.RollbackAsync(ct);
+            return new ReservationResult(ReservationOutcome.Error, "An internal error has occurred during the reservation.");
+        }
+    }
+}
+
+
+public class InventoryItem { 
+   public string Sku { get; set; } 
+   public int AvailableQuantity { get; set; } 
+}
+
+public class ReservationRecord { 
+public string IdempotencyKey { get; set; } 
+public string Sku { get; set; } 
+public int Quantity { get; set; } 
+public DateTime CreatedAt { get; set; } 
+}
+
+public class InventoryDbContext : DbContext
+{
+    public DbSet<InventoryItem> InventoryItems { get; set; }
+    public DbSet<ReservationRecord> Reservations { get; set; }
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<InventoryItem>().HasKey(i => i.Sku);
+        modelBuilder.Entity<ReservationRecord>().HasKey(r => r.IdempotencyKey);
+    }
+}

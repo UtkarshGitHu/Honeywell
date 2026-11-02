@@ -1,0 +1,110 @@
+import React, { useState, useEffect } from 'react';
+
+export function IssueBoard({ loadIssues }) {
+  const [searchInput, setSearchInput] = useState('');
+  const [query, setQuery] = useState('');
+  const [status, setStatus] = useState('all');
+  const [issues, setIssues] = useState([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [selectedId, setSelectedId] = useState(null);
+  const [retryCount, setRetryCount] = useState(0);
+
+  // Debounce search input by 300ms
+  useEffect(() => {
+    const handler = setTimeout(() => setQuery(searchInput), 300);
+    return () => clearTimeout(handler);
+  }, [searchInput]);
+
+  // Fetch issues with abort controller and mount checks
+  useEffect(() => {
+    const controller = new AbortController();
+    let isMounted = true;
+
+    const fetchIssues = async () => {
+      setIsLoading(true);
+      setError(null);
+
+      try {
+        const data = await loadIssues({
+          query,
+          status,
+          signal: controller.signal
+        });
+
+        if (isMounted) {
+          setIssues(data);
+          // Preserve selection if the previously selected ID remains in the new dataset
+          setSelectedId((prev) => (data.some((i) => i.id === prev) ? prev : null));
+          setIsLoading(false);
+        }
+      } catch (err) {
+        if (isMounted && err.name !== 'AbortError') {
+          setError(err.message || 'Failed to fetch issues');
+          setIsLoading(false);
+        }
+      }
+    };
+
+    fetchIssues();
+
+    return () => {
+      isMounted = false;
+      controller.abort(); // Cancel stale requests
+    };
+  }, [query, status, retryCount, loadIssues]);
+
+  return (
+    <div className="issue-board">
+      <div className="controls">
+        <label htmlFor="search-input">Search Issues</label>
+        <input
+          id="search-input"
+          type="text"
+          value={searchInput}
+          onChange={(e) => setSearchInput(e.target.value)}
+          placeholder="Search by title..."
+        />
+
+        <label htmlFor="status-filter">Status</label>
+        <select
+          id="status-filter"
+          value={status}
+          onChange={(e) => setStatus(e.target.value)}
+        >
+          <option value="all">All</option>
+          <option value="open">Open</option>
+          <option value="closed">Closed</option>
+        </select>
+      </div>
+
+      {isLoading && <div role="status">Loading...</div>}
+
+      {error && !isLoading && (
+        <div role="alert">
+          <p>{error}</p>
+          <button onClick={() => setRetryCount((c) => c + 1)}>Retry</button>
+        </div>
+      )}
+
+      {!isLoading && !error && issues.length === 0 && (
+        <p>No issues found.</p>
+      )}
+
+      {!isLoading && !error && issues.length > 0 && (
+        <ul aria-label="Issues List">
+          {issues.map((issue) => (
+            <li
+              key={issue.id}
+              onClick={() => setSelectedId(issue.id)}
+              aria-selected={selectedId === issue.id}
+              style={{ fontWeight: selectedId === issue.id ? 'bold' : 'normal', cursor: 'pointer' }}
+            >
+              {issue.title}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}

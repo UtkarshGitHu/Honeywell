@@ -1,0 +1,58 @@
+API Endpoints
+
+POST /api/v1/imports: Returns 202 Accepted with a unique jobId.
+
+GET /api/v1/imports/{jobId}/status: Returns current progress (e.g., {"status": "Processing", "progress": 45}).
+
+POST /api/v1/imports/{jobId}/cancel: Flags the active background job for termination.
+
+GET /api/v1/imports/{jobId}/errors: Returns a pre-signed URL to download the generated error report CSV once the job completes.
+
+Data Flow
+
+The client calls the POST /imports endpoint.
+
+The API streams the file directly to Object Storage (e.g., AWS S3) and creates a record in the database with a Pending status.
+
+The API publishes a message containing the jobId and fileUrl to a Message Queue (e.g., SQS or Azure Service Bus).
+
+A Background Worker pulls the message, downloads the CSV, and begins reading it line-by-line using a stream reader to maintain a low memory footprint.
+
+The worker processes records in batches (e.g., 1,000 rows per database transaction), validating data and executing UPSERT operations.
+
+The worker updates the job's progress percentage in the database after every batch and checks if a cancellation flag has been set.
+
+Invalid rows are appended to an error CSV file maintained in Object Storage.
+
+Upon completion (or cancellation), the job status is updated to Completed, Failed, or Cancelled, and the final error file URL is saved to the database.
+
+Persistence
+
+Object Storage: Stores raw inbound CSVs and outbound error reports.
+
+Relational Database (e.g., SQL Server/PostgreSQL):
+
+ImportJobs table: JobId, UserId, Status, TotalRows, ProcessedRows, FileUrl, ErrorFileUrl, IsCancelled.
+
+Products table: The destination schema for successfully validated rows.
+
+Background Processing
+Background processing should be handled by dedicated worker services separated from the web API (e.g., .NET Worker Services or AWS ECS Tasks). These workers stream the file rather than loading all 100,000 records into memory simultaneously. Batching database inserts minimizes connection overhead and maximizes write throughput.
+
+Idempotency
+
+API Level: The POST endpoint accepts an Idempotency-Key header. If a client retries the same upload due to a timeout, the API returns the existing jobId instead of spawning a duplicate job.
+
+Database Level: Database inserts utilize UPSERT (Insert or Update) logic keyed on a unique identifier (like SKU). If a worker crashes and a CSV is re-processed, existing records are safely overwritten without duplication.
+
+Security
+
+Restrict API access using JWT authorization, ensuring users can only check statuses or cancel jobs they initiated.
+
+Enforce a strict maximum payload size (e.g., 100MB) and validate MIME types on upload.
+
+Secure Object Storage by keeping buckets private and issuing time-limited, pre-signed URLs for uploading source files and downloading error reports.
+
+Failure Recovery
+Message queues provide native retry mechanisms via visibility timeouts. If a worker node crashes mid-processing, the message becomes visible again after the timeout expires, and another worker picks it up. The new worker checks the ImportJobs table, clears any incomplete batch states, and relies on the idempotent UPSERT logic to safely re-process the file. Repeatedly failing jobs are routed to a Dead Letter Queue (DLQ) for manual inspection.
+
